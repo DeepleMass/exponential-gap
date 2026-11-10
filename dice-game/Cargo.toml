@@ -1,0 +1,21 @@
+[package]
+name = "dice-game"
+version = "0.1.0"
+edition = "2021"
+description = "Experiment zur exponentiellen Entwicklung: N Spieler würfeln reihum; die Augenzahlen 1..=6 werden auf exponentiell steigende Faktoren in [1, sqrt(2)] abgebildet und mit dem Spielstand multipliziert."
+license = "MIT"
+
+# Bewusst keine externen Abhängigkeiten (kein Crates-Download nötig):
+# Der Zufallsgenerator (SplitMix64) ist im Projekt implementiert.
+[dependencies]
+
+[lib]
+name = "dice_game"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dice-game"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
