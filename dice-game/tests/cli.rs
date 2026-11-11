@@ -108,9 +108,9 @@ fn history_bleibt_ueber_viele_runden_in_der_ausgabe_begrenzt() {
     run_ok(&["init", "--players", "20", "--seed", "5", "--state", s]);
     let out = run_ok(&["play", "--rounds", "5000", "--state", s]);
     assert!(out.contains("meta,rounds,5000"));
-    // 100 volle Runden + Marker 200..3200 (5 Stück) + Endpunkt 5000 = 106.
+    // 1..=999 lückenlos (999) + Stride 10 in 1000..=5000 (401) = 1400.
     let n = count_hist_lines(&out);
-    assert!(n <= 120, "zu viele hist-Zeilen: {n}");
+    assert!((1300..=1500).contains(&n), "unerwartete hist-Anzahl: {n}");
     assert!(out.contains("hist,5000,")); // Endpunkt enthalten
     let _ = fs::remove_file(&state);
 }

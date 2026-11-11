@@ -10,10 +10,12 @@
 //! Startspielstand jedes Spielers ist `1.0`.
 //!
 //! Zusätzlich wird eine **Historie** der Rundenstände geführt (für das
-//! Liniendiagramm der GUI): jede Runde bis [`HISTORY_FULL_ROUNDS`], danach
-//! nur noch an geometrisch wachsenden Markern (200, 400, 800, ...), damit
-//! auch nach 1M Runden der Speicher begrenzt bleibt. Der Endpunkt einer
-//! gespielten Sequenz wird immer mitgespeichert.
+//! Liniendiagramm der GUI): bis Runde [`HISTORY_FULL_ROUNDS`] wird jede Runde
+//! aufgenommen, danach mit wachsender Schrittweite [`history_stride`]
+//! (bis 999 jede Runde, dann alle 10, 100, 1000, ... Runden – etwa 900
+//! Schnappschüsse pro Dekade). So bleibt auch nach 1M Runden der Speicher
+//! begrenzt und der „Ausläufer“ (die letzten Runden) hat genug Stützpunkte.
+//! Der Endpunkt einer gespielten Sequenz wird immer mitgespeichert.
 
 use crate::die::{self, FACES};
 use crate::rng::SplitMix64;
@@ -21,8 +23,26 @@ use crate::stats::{self, Statistics};
 
 /// Bis zu dieser Rundenzahl wird **jede** Runde in die Historie aufgenommen.
 pub const HISTORY_FULL_ROUNDS: u64 = 100;
-/// Erste geometrische Marke nach den vollen Runden (200, 400, 800, ...).
-pub const HISTORY_MARKER_START: u64 = 2 * HISTORY_FULL_ROUNDS;
+
+/// Schrittweite, in der eine Runde in die Historie aufgenommen wird.
+///
+/// Bis Runde 100 jede Runde (Stride 1); danach pro Dekade eine Zehnerpotenz:
+/// 101..=999 → 1, 1000..=9999 → 10, 10_000..=99_999 → 100, usw.
+pub fn history_stride(round: u64) -> u64 {
+    if round <= HISTORY_FULL_ROUNDS {
+        return 1;
+    }
+    // floor(log10(round)) über die Ziffernanzahl bestimmen.
+    let mut digits = 0u32;
+    let mut v = round;
+    while v > 0 {
+        v /= 10;
+        digits += 1;
+    }
+    // floor(log10(r)) = digits - 1; Stride = 10^(floor(log10(r)) - 2), mind. 1.
+    let exp = (digits as i64 - 3).max(0) as u32;
+    10u64.pow(exp)
+}
 
 /// Ein gespeicherter Zwischenstand: Rundennummer + log2-Spielstände aller Spieler.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,8 +104,6 @@ pub struct Game {
     rng: SplitMix64,
     /// Historie der Rundenstände (siehe Modul-Doku).
     history: Vec<RoundSnapshot>,
-    /// Nächste geometrische Marke, an der aufgezeichnet wird.
-    next_marker: u64,
 }
 
 impl Game {
@@ -101,7 +119,6 @@ impl Game {
             seed,
             rng: SplitMix64::new(seed),
             history: Vec::new(),
-            next_marker: HISTORY_MARKER_START,
         }
     }
 
@@ -109,13 +126,7 @@ impl Game {
     ///
     /// Der Zufallsgenerator wird aus Seed und Rundenanzahl neu abgeleitet,
     /// damit ein geladenes und weitergespieltes Spiel reproduzierbar bleibt.
-    pub fn from_state(
-        seed: u64,
-        rounds_played: u64,
-        log2_scores: Vec<f64>,
-        history: Vec<RoundSnapshot>,
-        next_marker: u64,
-    ) -> Self {
+    pub fn from_state(seed: u64, rounds_played: u64, log2_scores: Vec<f64>, history: Vec<RoundSnapshot>) -> Self {
         let players = log2_scores
             .into_iter()
             .enumerate()
@@ -132,7 +143,6 @@ impl Game {
             seed,
             rng,
             history,
-            next_marker,
         }
     }
 
@@ -154,11 +164,6 @@ impl Game {
     /// Gespeicherte Historie (aufsteigend nach Rundennummer).
     pub fn history(&self) -> &[RoundSnapshot] {
         &self.history
-    }
-
-    /// Nächste Historie-Marke (nur relevant für Persistenz/Tests).
-    pub fn next_history_marker(&self) -> u64 {
-        self.next_marker
     }
 
     /// Eine Runde spielen: Jeder Spieler würfelt genau einmal, reihum.
@@ -193,19 +198,15 @@ impl Game {
         }
     }
 
-    /// Speichert einen Schnappschuss, falls diese Runde eine History-Runde ist.
+    /// Speichert einen Schnappschuss, falls diese Runde laut [`history_stride`] dran ist.
     fn record_history(&mut self) {
         let r = self.rounds_played;
-        if r <= HISTORY_FULL_ROUNDS || r >= self.next_marker {
+        if r % history_stride(r) == 0 {
             let scores = self.log2_scores();
             self.history.push(RoundSnapshot {
                 round: r,
                 log2_scores: scores,
             });
-            if r > HISTORY_FULL_ROUNDS {
-                // Nächste Marke geometrisch verdoppeln (200, 400, 800, ...).
-                self.next_marker = r.saturating_mul(2).max(r + 1);
-            }
         }
     }
 
@@ -223,6 +224,19 @@ impl Game {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stride_wächst_pro_dekade() {
+        assert_eq!(history_stride(1), 1);
+        assert_eq!(history_stride(100), 1);
+        assert_eq!(history_stride(101), 1);
+        assert_eq!(history_stride(999), 1);
+        assert_eq!(history_stride(1000), 10);
+        assert_eq!(history_stride(5000), 10);
+        assert_eq!(history_stride(10_000), 100);
+        assert_eq!(history_stride(123_456), 1_000);
+        assert_eq!(history_stride(1_000_000), 10_000);
+    }
 
     #[test]
     fn neues_spiel_startet_bei_eins() {
@@ -313,16 +327,16 @@ mod tests {
     }
 
     #[test]
-    fn history_nach_100_runden_nur_noch_geometrische_marker() {
+    fn history_erfasst_bis_999_jede_runde_dann_stride() {
         let mut g = Game::new(5, 1);
-        g.play_rounds(250);
+        g.play_rounds(1050);
         let rounds: Vec<u64> = g.history().iter().map(|s| s.round).collect();
-        // 1..=100 vollständig, dann Marke 200, dann Endpunkt 250.
-        assert_eq!(rounds.len(), 102);
-        assert_eq!(rounds[99], 100);
-        assert_eq!(rounds[100], 200);
-        assert_eq!(rounds[101], 250); // Endpunkt der Sequenz
-        assert!(!rounds.contains(&150));
+        // 1..=999 lückenlos, dann Stride 10 (1000, 1010, ...), Endpunkt 1050.
+        assert_eq!(rounds.len(), 999 + 6); // 1..=999 + 1000,1010,1020,1030,1040,1050
+        assert_eq!(rounds[998], 999);
+        assert_eq!(rounds[999], 1000);
+        assert!(!rounds.contains(&1005));
+        assert_eq!(*rounds.last().unwrap(), 1050);
     }
 
     #[test]
@@ -330,28 +344,25 @@ mod tests {
         let mut g = Game::new(50, 3);
         g.play_rounds(200_000);
         let h = g.history();
-        // 100 volle Runden + Marker 200..102400 (13 Stück) + Endpunkt = max 114.
-        assert!(h.len() <= 120, "History zu groß: {}", h.len());
+        // ca. 100 + 899 + 900 + 900 + 101 ≈ 2900 Schnappschüsse.
+        assert!(h.len() <= 3200, "History zu groß: {}", h.len());
         assert_eq!(h.first().unwrap().round, 1);
         assert_eq!(h.last().unwrap().round, 200_000);
-        assert!(h.iter().any(|s| s.round == 102_400));
+        assert!(h.iter().any(|s| s.round == 150_000)); // 150_000 % 1000 == 0
         // aufsteigend sortiert
         assert!(h.windows(2).all(|w| w[0].round < w[1].round));
     }
 
     #[test]
-    fn from_state_nimmt_history_und_marker_mit() {
+    fn from_state_nimmt_history_mit() {
         let mut g = Game::new(5, 9);
         g.play_rounds(250);
-        let marker = g.next_history_marker();
         let h = g.history().to_vec();
-        let g2 = Game::from_state(9, 250, g.log2_scores(), h.clone(), marker);
+        let mut g2 = Game::from_state(9, 250, g.log2_scores(), h.clone());
         assert_eq!(g2.history(), h.as_slice());
-        assert_eq!(g2.next_history_marker(), marker);
-        // Weiterspielen zeichnet an der richtigen Marke auf (400).
-        let mut g2 = g2;
-        g2.play_rounds(150); // bis Runde 400
-        assert!(g2.history().iter().any(|s| s.round == 400));
+        // Weiterspielen zeichnet weiter (bis 999 jede Runde).
+        g2.play_rounds(50); // bis Runde 300
+        assert!(g2.history().iter().any(|s| s.round == 300));
     }
 
     #[test]

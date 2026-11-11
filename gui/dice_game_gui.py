@@ -7,8 +7,13 @@ kompilierten Rust-Binary (exponential-gap/dice-game/target/release/dice-game),
 das über eine Zustandsdatei persistiert und zwischen den Klicks fortgeführt wird.
 
 Ausgabe: Liniendiagramm – x = Rundennummer, y = Spielstand, eine fortlaufende
-Linie pro Spieler. Die y-Achse ist per Button zwischen linear und
-logarithmisch (log2) umschaltbar.
+Linie pro Spieler. Gezeigt werden nur die „Ausläufer“ (die letzten Runden;
+wie viele, hängt von der Gesamtrundenzahl ab). Die y-Achse ist per Button
+umschaltbar: **linear → log2 → log-log** (doppelt logarithmisch). Bei
+f64-Überlauf in linearer Ansicht wird das sanft abgefangen (inf statt Crash).
+
+Kosmetik: helle Farbpalette (Orange/Grün/Gelb/Blau) und abgerundete Rahmen
+(über einen Canvas-Trick, da tkinter keine nativ abgerundeten Frames kennt).
 
 Aufruf:
     python3 dice_game_gui.py
@@ -28,7 +33,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 # ---------------------------------------------------------------------------
-# Konstanten
+# Konstanten & Farbpalette (helle Töne)
 # ---------------------------------------------------------------------------
 
 APP_TITLE = "Dice Game – Exponentielles Würfelexperiment"
@@ -45,9 +50,56 @@ STATE_FILE = os.path.join(tempfile.gettempdir(), "dice_game_state.txt")
 #: Ab welchem log2-Wert die Anzeige auf „2^x“ umschaltet (f64-Grenze ~2^1024).
 SCORE_DISPLAY_LIMIT = 1000.0
 
-#: Linienfarbe der Spieler bzw. des aktuellen Spitzenreiters im Diagramm.
-LINE_COLOR = "#4C78A8"
-LEADER_COLOR = "#d62728"
+# --- Palette ---------------------------------------------------------------
+BG = "#f6f4ef"            # App-Hintergrund (warm hell)
+CARD = "#fffdf8"          # Karten-/Panel-Hintergrund
+CARD_BORDER = "#e7e5e4"   # dezente Rahmenfarbe
+INK = "#1f2937"           # Haupttext
+MUTED = "#78716c"         # Sekundärtext
+
+ORANGE_BG, ORANGE_FG = "#ffedd5", "#9a3412"
+GREEN_BG, GREEN_FG = "#dcfce7", "#166534"
+YELLOW_BG, YELLOW_FG = "#fef9c3", "#a16207"
+BLUE_BG, BLUE_FG = "#dbeafe", "#1d4ed8"
+
+CHART_BG = "#ffffff"
+GRID = "#eef2f7"
+AXIS = "#94a3b8"
+#: Linienfarben der Spieler (helle Töne, werden zyklisch verwendet).
+PLAYER_PALETTE = [
+    "#8ecae6", "#90be6d", "#f4a261", "#e9c46a", "#a0c4ff",
+    "#f28482", "#84a59d", "#ffb4a2", "#c3aed6", "#b5e48c",
+]
+LEADER_COLOR = "#e76f51"  # Spitzenreiter (kräftiges Orange)
+
+#: Ab wie vielen Gesamtrunden nur noch der Ausläufer gezeigt wird.
+TAIL_FULL_ROUNDS = 200
+
+#: y-Achsen-Modi; der Button klickt zyklisch durch.
+Y_MODES = ["log2", "linear", "loglog"]
+
+
+def next_y_mode(mode: str) -> str:
+    """Nächster y-Achsen-Modus im Zyklus (log2 -> linear -> loglog -> log2)."""
+    return Y_MODES[(Y_MODES.index(mode) + 1) % len(Y_MODES)]
+
+
+def y_value(log2_score: float, mode: str) -> float:
+    """Rechnet einen log2-Spielstand in den y-Achsen-Wert des Modus um.
+
+    Linear rechnet `2**log2` — das kann in Python OverflowError werfen
+    (anders als in Rust, wo es inf wird). Wird hier abgefangen: Ergebnis inf.
+    """
+    if mode == "log2":
+        return log2_score
+    if mode == "loglog":
+        # doppelt logarithmisch: log2(log2(score)); bei 0 auf kleinen Wert klemmen
+        return math.log2(log2_score) if log2_score > 0 else math.log2(1e-12)
+    # linear
+    try:
+        return 2.0 ** log2_score
+    except OverflowError:
+        return math.inf
 
 
 def default_binary() -> str:
@@ -64,6 +116,17 @@ def default_binary() -> str:
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
     return ""
+
+
+def tail_window(total_rounds: int) -> int:
+    """Wie viele der letzten Runden im Diagramm gezeigt werden (0 = alle).
+
+    Hängt von der Gesamtrundenzahl ab: bis 200 Runden wird alles gezeigt,
+    danach die letzten 10 % (mindestens aber die letzten 100 Runden).
+    """
+    if total_rounds <= TAIL_FULL_ROUNDS:
+        return 0
+    return max(100, total_rounds // 10)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +300,73 @@ def fmt_big(x: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Abgerundeter Rahmen (tkinter kann das nicht nativ -> Canvas-Trick)
+# ---------------------------------------------------------------------------
+
+
+def _rounded_rect_points(x1: float, y1: float, x2: float, y2: float, r: float) -> list[float]:
+    """Eckpunkte eines abgerundeten Rechtecks (Bögen an den vier Ecken)."""
+    import math as _m
+    pts: list[float] = []
+    corners = (
+        (x1 + r, y1 + r, 180),  # oben links
+        (x2 - r, y1 + r, 270),  # oben rechts
+        (x2 - r, y2 - r, 0),    # unten rechts
+        (x1 + r, y2 - r, 90),   # unten links
+    )
+    for cx, cy, a0 in corners:
+        for deg in range(a0, a0 + 91, 15):
+            a = _m.radians(deg)
+            pts.append(cx + r * _m.cos(a))
+            pts.append(cy + r * _m.sin(a))
+    return pts
+
+
+class RoundedFrame(tk.Canvas):
+    """Abgerundete Karte: Canvas zeichnet das rounded rect, innen liegt ein Frame.
+
+    Kinder werden in `self.card` gepackt (ttk.Frame mit Style „Card.TFrame“).
+    """
+
+    def __init__(
+        self,
+        master,
+        title: str = "",
+        bg: str = CARD,
+        border: str = CARD_BORDER,
+        title_fg: str = MUTED,
+        radius: int = 14,
+        pad: int = 10,
+        outer_bg: str = BG,
+        **kw,
+    ):
+        super().__init__(master, highlightthickness=0, bg=outer_bg, **kw)
+        self._bg, self._border, self._r, self._pad = bg, border, radius, pad
+        self.card = ttk.Frame(self, style="Card.TFrame")
+        if title:
+            ttk.Label(self.card, text=title, style="CardTitle.TLabel", foreground=title_fg).pack(anchor="w")
+        self._win = self.create_window(pad, pad, anchor="nw", window=self.card)
+        self.card.bind("<Configure>", lambda _e: self._fit())
+
+    def _fit(self) -> None:
+        w = self.card.winfo_reqwidth() + 2 * self._pad
+        h = self.card.winfo_reqheight() + 2 * self._pad
+        self.configure(width=w, height=h)
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("bg")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4 or h < 4:
+            return
+        r = min(self._r, w / 2, h / 2)
+        pts = _rounded_rect_points(1, 1, w - 1, h - 1, r)
+        self.create_polygon(*pts, fill=self._bg, outline=self._border, width=1, smooth=True, tags="bg")
+        self.tag_lower("bg")
+        self.coords(self._win, self._pad, self._pad)
+
+
+# ---------------------------------------------------------------------------
 # Liniendiagramm-Leinwand
 # ---------------------------------------------------------------------------
 
@@ -244,20 +374,22 @@ def fmt_big(x: float) -> str:
 class LineChartCanvas(tk.Canvas):
     """Liniendiagramm: x = Rundennummer, y = Spielstand (linear oder log2).
 
-    Pro Spieler eine fortlaufende Linie nach rechts. Der aktuelle
-    Spitzenreiter wird hervorgehoben.
+    Pro Spieler eine fortlaufende Linie nach rechts (Palette aus hellen
+    Tönen), der aktuelle Spitzenreiter kräftiger hervorgehoben.
     """
 
     def __init__(self, master, **kw):
-        super().__init__(master, bg="white", highlightthickness=1, highlightbackground="#999", **kw)
+        super().__init__(master, bg=CHART_BG, highlightthickness=0, **kw)
         self._history: list[tuple[int, list[float]]] = []
-        self._log_y = True
+        self._y_mode = "log2"
+        self._total_rounds = 0
         # Neu zeichnen, sobald die Größe feststeht.
         self.bind("<Configure>", lambda _e: self.redraw())
 
-    def set_data(self, history: list[tuple[int, list[float]]], log_y: bool) -> None:
+    def set_data(self, history: list[tuple[int, list[float]]], y_mode: str, total_rounds: int = 0) -> None:
         self._history = history
-        self._log_y = log_y
+        self._y_mode = y_mode
+        self._total_rounds = total_rounds
         self.redraw()
 
     def redraw(self) -> None:
@@ -269,17 +401,21 @@ class LineChartCanvas(tk.Canvas):
 
         # Achsen
         y_base = pad_t + ch  # unten
-        self.create_line(pad_l, pad_t, pad_l, y_base, fill="black")
-        self.create_line(pad_l, y_base, pad_l + cw, y_base, fill="black")
-        self.create_text(pad_l + cw / 2, h - 12, text="Rundennummer", anchor="n")
-        y_label = "log2(Spielstand)" if self._log_y else "Spielstand (linear)"
-        self.create_text(16, pad_t + ch / 2, text=y_label, angle=90, anchor="center")
+        self.create_line(pad_l, pad_t, pad_l, y_base, fill=AXIS)
+        self.create_line(pad_l, y_base, pad_l + cw, y_base, fill=AXIS)
+        self.create_text(pad_l + cw / 2, h - 12, text="Rundennummer", fill=MUTED, anchor="n")
+        y_label = {
+            "log2": "log2(Spielstand)",
+            "linear": "Spielstand (linear)",
+            "loglog": "log2(log2(Spielstand))",
+        }[self._y_mode]
+        self.create_text(16, pad_t + ch / 2, text=y_label, fill=MUTED, angle=90, anchor="center")
 
         if not self._history:
             self.create_text(
                 pad_l + cw / 2, pad_t + ch / 2,
                 text="Noch keine Daten – bitte „Neu starten“ klicken.",
-                fill="#666",
+                fill=MUTED,
             )
             return
 
@@ -289,15 +425,15 @@ class LineChartCanvas(tk.Canvas):
         if rx1 <= rx0:
             rx1 = rx0 + 1
 
-        # y-Werte: linear = 2^log2 (kann bei vielen Runden inf werden), log = log2.
+        # y-Werte je nach Modus (linear kann inf liefern — wird unten abgefangen).
         def yval(log2: float) -> float:
-            return log2 if self._log_y else 2.0 ** log2
+            return y_value(log2, self._y_mode)
 
         all_vals = [yval(v) for _, scores in self._history for v in scores]
         finite = [v for v in all_vals if math.isfinite(v)]
         overflow = len(finite) < len(all_vals)
         if not finite:
-            self.create_text(pad_l + cw / 2, pad_t + ch / 2, text="keine endlichen Werte", fill="#a00")
+            self.create_text(pad_l + cw / 2, pad_t + ch / 2, text="keine endlichen Werte", fill="#dc2626")
             return
         ymin, ymax = min(finite), max(finite)
         if ymax <= ymin:
@@ -314,17 +450,18 @@ class LineChartCanvas(tk.Canvas):
             frac = k / 4
             rv = rx0 + frac * (rx1 - rx0)
             xv = X(rv)
-            self.create_line(xv, y_base, xv, y_base + 5, fill="black")
-            self.create_text(xv, y_base + 10, text=str(int(rv)), anchor="n")
+            self.create_line(xv, y_base, xv, y_base + 5, fill=AXIS)
+            self.create_text(xv, y_base + 10, text=str(int(rv)), fill=MUTED, anchor="n")
 
-        # y-Achsen-Beschriftung: 5 Ticks
+        # y-Achsen-Beschriftung: 5 Ticks + dezentes Gitter
         for k in range(5):
             frac = k / 4
             yv = ymin + frac * (ymax - ymin)
             ypix = Y(yv)
-            self.create_line(pad_l - 5, ypix, pad_l, ypix, fill="black")
-            label = fmt_num(yv) if self._log_y else fmt_big(yv)
-            self.create_text(pad_l - 8, ypix, text=label, anchor="e")
+            self.create_line(pad_l, ypix, pad_l + cw, ypix, fill=GRID)
+            self.create_line(pad_l - 5, ypix, pad_l, ypix, fill=AXIS)
+            label = fmt_big(yv) if self._y_mode == "linear" else fmt_num(yv)
+            self.create_text(pad_l - 8, ypix, text=label, fill=MUTED, anchor="e")
 
         # Linien pro Spieler (x = Runde nach rechts, y = Spielstand)
         leader_idx = max(range(n_players), key=lambda i: self._history[-1][1][i])
@@ -339,23 +476,72 @@ class LineChartCanvas(tk.Canvas):
             is_leader = i == leader_idx
             self.create_line(
                 *pts,
-                fill=LEADER_COLOR if is_leader else LINE_COLOR,
+                fill=LEADER_COLOR if is_leader else PLAYER_PALETTE[i % len(PLAYER_PALETTE)],
                 width=2 if is_leader else 1,
             )
 
-        # Titel + ggf. Überlauf-Hinweis
-        mode = "log2" if self._log_y else "linear"
+        # Titel: gezeigter Ausläufer + Modus
+        if self._total_rounds > rounds[-1]:
+            span = f"Runden {rounds[0]}–{rounds[-1]} (Ausläufer von {self._total_rounds} gesamt)"
+        else:
+            span = f"Runden {rounds[0]}–{rounds[-1]}"
         self.create_text(
             pad_l + cw / 2, 12,
-            text=f"Spielstand je Spieler über die Runden ({n_players} Spieler, y-Achse: {mode})",
-            anchor="n",
+            text=f"Spielstand je Spieler – {span} | {n_players} Spieler | y: {self._y_mode}",
+            fill=INK, anchor="n",
         )
-        if overflow and not self._log_y:
+        if overflow and self._y_mode == "linear":
             self.create_text(
                 pad_l + cw / 2, 28,
-                text="Hinweis: Werte über dem f64-Maximum sind unendlich – in linearer Ansicht abgeschnitten. Log-Achse nutzen.",
-                fill="#a00", anchor="n",
+                text="Hinweis: Spielstände über dem f64-Maximum sind unendlich – in linearer Ansicht abgeschnitten. Per Button auf log2 oder log-log wechseln.",
+                fill="#dc2626", anchor="n",
             )
+
+
+# ---------------------------------------------------------------------------
+# Theme
+# ---------------------------------------------------------------------------
+
+
+def apply_theme(root: tk.Tk) -> None:
+    """Helle Palette auf ttk-Theme „clam“ legen (erlaubt Farb-Anpassung)."""
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure(".", background=BG, foreground=INK, fieldbackground="#ffffff")
+    style.configure("TFrame", background=BG)
+    style.configure("TLabel", background=BG, foreground=INK)
+    style.configure("TButton", background=ORANGE_BG, foreground=ORANGE_FG,
+                    bordercolor="#fdba74", focuscolor="#fb923c", padding=6)
+    style.map("TButton",
+              background=[("active", "#fed7aa"), ("pressed", "#fdba74")],
+              foreground=[("active", ORANGE_FG), ("pressed", ORANGE_FG)])
+    for name, bg, fg in (
+        ("Orange.TButton", ORANGE_BG, ORANGE_FG),
+        ("Green.TButton", GREEN_BG, GREEN_FG),
+        ("Yellow.TButton", YELLOW_BG, YELLOW_FG),
+        ("Blue.TButton", BLUE_BG, BLUE_FG),
+    ):
+        style.configure(name, background=bg, foreground=fg, bordercolor=bg, focuscolor=fg, padding=6)
+        style.map(name, background=[("active", bg), ("pressed", bg)],
+                  foreground=[("active", fg), ("pressed", fg)])
+    style.configure("TEntry", fieldbackground="#ffffff", foreground=INK)
+    style.configure("TSpinbox", fieldbackground="#ffffff", foreground=INK, arrowcolor=INK)
+    style.configure("TCombobox", fieldbackground="#ffffff", background="#ffffff", foreground=INK)
+    style.configure("Card.TFrame", background=CARD)
+    style.configure("Card.TLabel", background=CARD, foreground=INK)
+    style.configure("CardTitle.TLabel", background=CARD, foreground=MUTED,
+                    font=("TkDefaultFont", 9, "bold"))
+    style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff",
+                    foreground=INK, rowheight=22)
+    style.configure("Treeview.Heading", background=BLUE_BG, foreground=BLUE_FG,
+                    font=("TkDefaultFont", 9, "bold"))
+    style.map("Treeview", background=[("selected", "#bfdbfe")],
+              foreground=[("selected", "#1e3a8a")])
+    style.configure("Horizontal.TSeparator", background=CARD_BORDER)
+    root.configure(bg=BG)
 
 
 # ---------------------------------------------------------------------------
@@ -368,13 +554,14 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
+        apply_theme(self)
         self.title(APP_TITLE)
-        self.geometry("1100x700")
-        self.minsize(850, 550)
+        self.geometry("1150x720")
+        self.minsize(900, 580)
 
         self.engine: DiceGameEngine | None = None
         self.snapshot: Snapshot | None = None
-        self._log_y = True  # Startmodus der y-Achse: logarithmisch (log2)
+        self._y_mode = "log2"  # Startmodus der y-Achse: logarithmisch (log2)
 
         self._build_menu()
         self._build_toolbar()
@@ -391,14 +578,16 @@ class App(tk.Tk):
     # -- Aufbau ---------------------------------------------------------------
 
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self)
-        menu_file = tk.Menu(menubar, tearoff=0)
+        menubar = tk.Menu(self, bg="#ffffff", fg=INK, activebackground=ORANGE_BG, activeforeground=ORANGE_FG)
+        menu_file = tk.Menu(menubar, tearoff=0, bg="#ffffff", fg=INK,
+                           activebackground=ORANGE_BG, activeforeground=ORANGE_FG)
         menu_file.add_command(label="Neu starten", command=self.on_new, accelerator="Strg+N")
         menu_file.add_command(label="Binary wechseln…", command=self.on_browse_binary)
         menu_file.add_separator()
         menu_file.add_command(label="Beenden", command=self.destroy, accelerator="Strg+Q")
         menubar.add_cascade(label="Datei", menu=menu_file)
-        menu_help = tk.Menu(menubar, tearoff=0)
+        menu_help = tk.Menu(menubar, tearoff=0, bg="#ffffff", fg=INK,
+                           activebackground=ORANGE_BG, activeforeground=ORANGE_FG)
         menu_help.add_command(label="Über…", command=self.on_about)
         menubar.add_cascade(label="Hilfe", menu=menu_help)
         self.config(menu=menubar)
@@ -417,12 +606,12 @@ class App(tk.Tk):
         self.seed_var = tk.StringVar(value=str(DEFAULT_SEED))
         ttk.Entry(bar, textvariable=self.seed_var, width=8).pack(side="left", padx=(2, 10))
 
-        ttk.Button(bar, text="Neu starten", command=self.on_new).pack(side="left", padx=(0, 10))
+        ttk.Button(bar, text="Neu starten", style="Orange.TButton", command=self.on_new).pack(side="left", padx=(0, 10))
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
 
-        ttk.Button(bar, text="1 Runde spielen", command=self.on_play_one).pack(side="left")
-        ttk.Button(bar, text="N Runden spielen", command=self.on_play_n).pack(side="left", padx=(6, 2))
+        ttk.Button(bar, text="1 Runde spielen", style="Green.TButton", command=self.on_play_one).pack(side="left")
+        ttk.Button(bar, text="N Runden spielen", style="Blue.TButton", command=self.on_play_n).pack(side="left", padx=(6, 2))
         self.rounds_label_var = tk.StringVar(value="100")
         self.rounds_combo = ttk.Combobox(
             bar,
@@ -443,59 +632,63 @@ class App(tk.Tk):
         ttk.Button(bar, text="übernehmen", command=self._apply_binary).pack(side="left", padx=(4, 0))
 
     def _build_main(self) -> None:
-        main = ttk.Frame(self, padding=6)
+        main = ttk.Frame(self, padding=8)
         main.pack(side="top", fill="both", expand=True)
 
-        # Linke Seite: Liniendiagramm + Optionen darunter
-        left = ttk.Frame(main)
-        left.pack(side="left", fill="both", expand=True)
-        self.canvas = LineChartCanvas(left)
-        self.canvas.pack(side="top", fill="both", expand=True)
-        opts = ttk.Frame(left)
-        opts.pack(side="bottom", fill="x", pady=(4, 0))
+        # Linke Seite: Diagramm in abgerundeter Karte
+        chart_card = RoundedFrame(main, title="Verlauf der Spielstände",
+                                  border="#fdba74", title_fg=ORANGE_FG)
+        chart_card.pack(side="left", fill="both", expand=True)
+        self.canvas = LineChartCanvas(chart_card.card, width=680, height=440)
+        self.canvas.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+        opts = ttk.Frame(chart_card.card, style="Card.TFrame")
+        opts.pack(side="bottom", fill="x", padx=6, pady=(0, 8))
         # Button zum Umschalten der y-Achse zwischen logarithmisch und linear.
-        self.yaxis_button = ttk.Button(opts, text=self._yaxis_button_text(), command=self._toggle_yaxis)
+        self.yaxis_button = ttk.Button(opts, text=self._yaxis_button_text(),
+                                       style="Yellow.TButton", command=self._toggle_yaxis)
         self.yaxis_button.pack(side="left")
-        ttk.Label(opts, text="(x = Rundennummer, y = Spielstand; eine Linie pro Spieler)").pack(side="left", padx=8)
+        ttk.Label(opts, text="(x = Rundennummer, y = Spielstand; eine Linie pro Spieler, nur Ausläufer)",
+                  style="Card.TLabel", foreground=MUTED).pack(side="left", padx=8)
 
-        # Rechte Seite: Statistik + Top 10 + Log
-        right = ttk.Frame(main, width=360)
+        # Rechte Seite: drei abgerundete Karten (Statistik, Top 10, Log)
+        right = ttk.Frame(main, width=380)
         right.pack(side="right", fill="y", padx=(8, 0))
         right.pack_propagate(False)
 
-        stats_box = ttk.LabelFrame(right, text="Statistik", padding=6)
-        stats_box.pack(side="top", fill="x")
+        stats_card = RoundedFrame(right, title="Statistik", border="#a7f3d0", title_fg=GREEN_FG)
+        stats_card.pack(side="top", fill="x", pady=(0, 8))
         self.stats_var = tk.StringVar(value="–")
-        ttk.Label(stats_box, textvariable=self.stats_var, justify="left", font=("TkFixedFont", 9)).pack(anchor="w")
+        ttk.Label(stats_card.card, textvariable=self.stats_var, style="Card.TLabel",
+                  justify="left", font=("TkFixedFont", 9)).pack(anchor="w", padx=4, pady=4)
 
-        top_box = ttk.LabelFrame(right, text="Top 10 Spieler", padding=6)
-        top_box.pack(side="top", fill="both", expand=True, pady=(6, 0))
+        top_card = RoundedFrame(right, title="Top 10 Spieler", border="#bfdbfe", title_fg=BLUE_FG)
+        top_card.pack(side="top", fill="both", expand=True, pady=(0, 8))
         columns = ("rang", "spieler", "spielstand")
-        self.top_tree = ttk.Treeview(top_box, columns=columns, show="headings", height=10)
+        self.top_tree = ttk.Treeview(top_card.card, columns=columns, show="headings", height=10)
         self.top_tree.heading("rang", text="Rang")
         self.top_tree.heading("spieler", text="Spieler")
         self.top_tree.heading("spielstand", text="Spielstand")
         self.top_tree.column("rang", width=45, anchor="e")
         self.top_tree.column("spieler", width=60, anchor="e")
-        self.top_tree.column("spielstand", width=170, anchor="e")
-        vsb = ttk.Scrollbar(top_box, orient="vertical", command=self.top_tree.yview)
+        self.top_tree.column("spielstand", width=200, anchor="e")
+        vsb = ttk.Scrollbar(top_card.card, orient="vertical", command=self.top_tree.yview)
         self.top_tree.configure(yscrollcommand=vsb.set)
-        self.top_tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        self.top_tree.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        vsb.pack(side="right", fill="y", pady=4)
 
-        log_box = ttk.LabelFrame(right, text="Log", padding=6)
-        log_box.pack(side="top", fill="both", expand=True, pady=(6, 0))
-        self.log_text = tk.Text(log_box, height=8, wrap="word", state="disabled")
-        lsb = ttk.Scrollbar(log_box, orient="vertical", command=self.log_text.yview)
+        log_card = RoundedFrame(right, title="Log", border="#fef08a", title_fg=YELLOW_FG)
+        log_card.pack(side="top", fill="both", expand=True)
+        self.log_text = tk.Text(log_card.card, height=8, wrap="word", state="disabled",
+                                bg="#ffffff", fg=INK, relief="flat")
+        lsb = ttk.Scrollbar(log_card.card, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=lsb.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        lsb.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        lsb.pack(side="right", fill="y", pady=4)
 
     def _build_statusbar(self) -> None:
         self.status_var = tk.StringVar(value="Bereit.")
-        ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 2)).pack(
-            side="bottom", fill="x"
-        )
+        tk.Label(self, textvariable=self.status_var, bg=BLUE_BG, fg=BLUE_FG,
+                 anchor="w", padx=8, pady=3).pack(side="bottom", fill="x")
 
     # -- Engine / Aktionen ----------------------------------------------------
 
@@ -553,7 +746,7 @@ class App(tk.Tk):
             return
         self.snapshot = snap
         self.log(f"Neues Spiel: {players} Spieler, Seed {seed}, Runde 0.")
-        self._refresh()
+        self._safe_refresh()
 
     def on_play_one(self) -> None:
         """Genau eine Runde spielen."""
@@ -584,21 +777,29 @@ class App(tk.Tk):
         self.config(cursor="")
         self.snapshot = snap
         self.log(f"{label} gespielt → jetzt Runde {snap.rounds} ({dt:.2f} s, {len(snap.history)} History-Punkte).")
-        self._refresh()
+        self._safe_refresh()
 
     # -- y-Achse umschalten ------------------------------------------------------
 
     def _yaxis_button_text(self) -> str:
-        return f"Y-Achse: {'log2' if self._log_y else 'linear'}"
+        return f"Y-Achse: {self._y_mode}"
 
     def _toggle_yaxis(self) -> None:
-        """Schaltet die y-Achse des Diagramms zwischen log2 und linear um."""
-        self._log_y = not self._log_y
+        """Klickt die y-Achse zyklisch durch: log2 -> linear -> loglog -> log2."""
+        self._y_mode = next_y_mode(self._y_mode)
         self.yaxis_button.config(text=self._yaxis_button_text())
-        self.log(f"Y-Achse umgeschaltet: {'log2' if self._log_y else 'linear'}.")
+        self.log(f"Y-Achse umgeschaltet: {self._y_mode}.")
         self._redraw_chart()
 
     # -- Anzeige aktualisieren ------------------------------------------------
+
+    def _safe_refresh(self) -> None:
+        """Sanfter Abbruch: Anzeigefehler (z. B. beim Zeichnen) nicht durchreichen."""
+        try:
+            self._refresh()
+        except Exception as exc:  # Tk-Callback darf nicht crashen
+            self.log(f"WARN: Anzeige konnte nicht aktualisiert werden: {exc}")
+            self.status_var.set(f"Anzeige-Fehler (Spielstand ok): {exc}")
 
     def _refresh(self) -> None:
         snap = self.snapshot
@@ -622,17 +823,29 @@ class App(tk.Tk):
             self.top_tree.delete(item)
         for rank, (idx, log2) in enumerate(snap.top_players[:10], start=1):
             self.top_tree.insert("", "end", values=(rank, idx, fmt_score(log2)))
-        # Liniendiagramm (x = Runde, y = Spielstand je Spieler)
+        # Liniendiagramm (nur Ausläufer, x = Runde, y = Spielstand je Spieler)
         self._redraw_chart()
         self.status_var.set(
             f"Runde {snap.rounds} | {snap.players} Spieler | "
             f"Spannweite log2: {fmt_num(snap.min_log2)} … {fmt_num(snap.max_log2)} | "
-            f"Y-Achse: {'log2' if self._log_y else 'linear'}"
+            f"Y-Achse: {self._y_mode}"
         )
 
     def _redraw_chart(self) -> None:
-        if self.snapshot is not None:
-            self.canvas.set_data(self.snapshot.history, self._log_y)
+        snap = self.snapshot
+        if snap is None:
+            return
+        # Nur die Ausläufer zeigen: Fenster hängt von der Gesamtrundenzahl ab.
+        window = tail_window(snap.rounds)
+        hist = snap.history
+        if window:
+            hist = [s for s in hist if s[0] >= snap.rounds - window] or hist[-1:]
+        try:
+            self.canvas.set_data(hist, self._y_mode, total_rounds=snap.rounds)
+        except Exception as exc:
+            # sanfter Abbruch: Diagramm-Fehler loggen, App bleibt benutzbar
+            self.log(f"WARN: Diagramm konnte nicht gezeichnet werden: {exc}")
+            self.status_var.set(f"Diagramm-Fehler: {exc} (Spielstand ist korrekt)")
 
     # -- Log / Hilfe ------------------------------------------------------------
 
@@ -650,8 +863,9 @@ class App(tk.Tk):
             "N Spieler starten bei Spielstand 1.0. Pro Runde würfelt jeder Spieler\n"
             "reihum; die Augenzahl 1..6 wird auf einen exponentiell steigenden\n"
             "Faktor in [1, sqrt(2)] abgebildet und mit dem Spielstand multipliziert.\n\n"
-            "Diagramm: x = Rundennummer, y = Spielstand (linear oder log2, umschaltbar),\n"
-            "eine Linie pro Spieler.\n\n"
+            "Diagramm: x = Rundennummer, y = Spielstand, eine Linie pro Spieler;\n"
+            "gezeigt werden nur die letzten Runden (Ausläufer). Y-Achse per Button\n"
+            "umschaltbar: linear / log2 / log-log (doppelt logarithmisch).\n\n"
             "Motor: Rust-Binary „dice-game“ (Projekt ../dice-game).\n"
             "GUI: Python + tkinter (nur Standardbibliothek).",
         )

@@ -43,6 +43,6 @@ pub mod state;
 pub mod stats;
 
 pub use die::{expected_log2_per_roll, face_log2, face_value, FACES, MAX_FACE, MIN_FACE};
-pub use game::{Game, Player, RoundSnapshot, HISTORY_FULL_ROUNDS, HISTORY_MARKER_START};
+pub use game::{history_stride, Game, Player, RoundSnapshot, HISTORY_FULL_ROUNDS};
 pub use rng::SplitMix64;
 pub use stats::{summarize, Statistics};

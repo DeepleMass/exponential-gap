@@ -103,24 +103,25 @@ hist,<round>,<log2_0>,<log2_1>,...    # ein Schnappschuss je History-Runde
 
 Damit pro Spieler und pro Runde ein Linienpunkt gezeichnet werden kann, führt
 `Game` eine Historie der Rundenstände: **jede** Runde bis Runde 100, danach
-nur noch an geometrisch wachsenden Markern (200, 400, 800, ...); der Endpunkt
-einer gespielten Sequenz wird immer mitgespeichert. So bleibt der Speicher auch
-bei 1M Runden begrenzt (ca. 115 Schnappschüsse statt 1M).
+mit dekadenweise wachsender Schrittweite (`history_stride`: bis 999 jede Runde,
+dann alle 10, 100, 1000, ... Runden – ca. 900 Schnappschüsse pro Dekade). Der
+Endpunkt einer gespielten Sequenz wird immer mitgespeichert. So bleibt der
+Speicher auch bei 1M Runden begrenzt (~3700 Schnappschüsse) und der „Ausläufer“
+(die letzten Runden, die die GUI allein zeigt) hat genug Stützpunkte.
 
-### Zustandsdatei (v2)
+### Zustandsdatei (v3)
 
 ```text
-dice-game-state v2
+dice-game-state v3
 seed=42
 rounds=10
 players=100
-marker=200
 log2=0.0 0.1 0.2 ...
 hist=1 0.0 0.1 ...
 hist=2 ...
 ```
 
-v1-Dateien (ohne Historie) werden weiterhin gelesen.
+v1- und v2-Dateien bleiben lesbar (v2-`marker=` wird ignoriert).
 
 ### Als Bibliothek
 

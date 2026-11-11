@@ -90,16 +90,17 @@ fn exponential_gap_wird_sichtbar() {
 
 #[test]
 fn history_ist_vollstaendig_und_gekappt() {
-    // Bis Runde 100 jede Runde, dann geometrische Marker + Endpunkt.
+    // Bis 999 jede Runde, dann Stride 10; Endpunkt inklusive.
     let mut game = Game::new(30, 17);
     game.play_rounds(5000);
     let h = game.history();
     let rounds: Vec<u64> = h.iter().map(|s| s.round).collect();
     assert_eq!(&rounds[..10], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    assert_eq!(rounds[100], 200); // erste Marker nach den vollen Runden
-    assert!(!rounds.contains(&150));
+    assert!(rounds.contains(&999));
+    assert!(rounds.contains(&1000));
+    assert!(!rounds.contains(&1005)); // Stride 10 ab Runde 1000
     assert_eq!(*rounds.last().unwrap(), 5000); // Endpunkt
-    assert!(h.len() <= 120);
+    assert!(h.len() <= 1500);
     // Jeder Schnappschuss hat alle Spieler und aufsteigende Runden.
     assert!(h.iter().all(|s| s.log2_scores.len() == 30));
     assert!(h.windows(2).all(|w| w[0].round < w[1].round));

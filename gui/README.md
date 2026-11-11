@@ -25,8 +25,10 @@ In der GUI kann der Pfad auch manuell eingetragen/durchsucht werden.
 | **Neu starten** | Legt ein neues Spiel in der Zustandsdatei an |
 | **1 Runde spielen** | Spielt genau eine Runde (alle Spieler würfeln reihum) |
 | **N Runden spielen** + Dropdown | Spielt 1 / 10 / 100 / 1k / 1M Runden auf einen Klick |
-| Liniendiagramm | x = Rundennummer, y = Spielstand, eine fortlaufende Linie pro Spieler (Spitzenreiter hervorgehoben); **Y-Achse per Button zwischen log2 und linear umschaltbar** |
-| Y-Achse-Button | schaltet die y-Achse des Diagramms zwischen logarithmisch (log2, default) und linear um |
+| Liniendiagramm | x = Rundennummer, y = Spielstand, eine fortlaufende Linie pro Spieler (helle Farbpalette, Spitzenreiter kräftig hervorgehoben); **nur die Ausläufer** (die letzten Runden) werden gezeigt — Fenster = letzte 10 % der Gesamtrunden, mind. 100, bis 200 Runden alles |
+| Y-Achse-Button (gelb) | klickt zyklisch durch **log2 (default) → linear → log-log** (doppelt logarithmisch). Linear rechnet `2**log2`; Überlauf wird per try/except als `inf` abgefangen (kein Crash mehr), im Diagramm erscheint ein Hinweis |
+| Fehlerbehandlung | Anzeige-/Zeichenfehler werden per try/except sanft abgefangen (Log + Statusleiste), die App bleibt benutzbar |
+| Kosmetik | helle Palette (Orange/Grün/Gelb/Blau) via ttk-Theme „clam“; Panels als **abgerundete Karten** (`RoundedFrame`, Canvas-Trick, da tkinter keine nativ abgerundeten Rahmen kennt) |
 | Statistik-Panel | Runden, min/median/mean/max/std der log2-Werte, min/geom.Mittel/max Spielstand |
 | Top 10 | Die höchsten Spielstände (ab 2^1000 als `2^x` dargestellt) |
 | Log + Statusleiste | Letzte Aktionen und aktueller Zustand |
@@ -45,6 +47,7 @@ status                 --state <datei>         # Stand lesen
 Die Ausgabe ist maschinenlesbar (`meta,rounds,...` / `player,<i>,<log2>,<score>` /
 `hist,<round>,<log2_0>,...`) und wird von `parse_output()` in ein `Snapshot`-Objekt
 geparst. Die `hist`-Zeilen sind die Historie für das Liniendiagramm (jede Runde
-bis 100, dann geometrische Marker — im Rust-Projekt dokumentiert).
+bis 999, dann dekadenweise Strides — im Rust-Projekt dokumentiert). Daraus
+wählt die GUI per `tail_window()` nur die letzten Runden (Ausläufer) aus.
 Der Zustand liegt in einer Textdatei (`$TMPDIR/dice_game_state.txt`),
 dadurch bleibt das Spiel über GUI-Neustarts und Klicks hinweg erhalten.
