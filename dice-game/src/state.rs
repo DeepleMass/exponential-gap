@@ -2,18 +2,23 @@
 //!
 //! Damit kann das GUI (oder die CLI) ein Spiel über mehrere Aufrufe hinweg
 //! fortsetzen: `init` legt die Datei an, `play` liest, spielt und schreibt
-//! zurück, `status` liest nur.
+//! zurück, `status` liest nur. Die Historie (für das Liniendiagramm) wird
+//! mitgespeichert.
 //!
-//! Dateiformat (menschen- und maschinenlesbar):
+//! Dateiformat v2 (menschen- und maschinenlesbar):
 //!
 //! ```text
-//! dice-game-state v1
+//! dice-game-state v2
 //! seed=42
 //! rounds=10
 //! players=100
+//! marker=200
 //! log2=0.0 0.1 0.2 ...
+//! hist=1 0.0 0.1 ...
+//! hist=2 ...
 //! ```
 //!
+//! v1-Dateien (ohne Historie) werden weiterhin gelesen.
 //! Gespeichert wird nur der log2-Spielstand (numerisch stabil); der lineare
 //! Spielstand wird beim Laden als `2^log2` rekonstruiert.
 
@@ -21,12 +26,14 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::game::Game;
+use crate::game::{Game, RoundSnapshot, HISTORY_FULL_ROUNDS, HISTORY_MARKER_START};
 
-/// Erste Zeile jeder Zustandsdatei (Versionskennung).
-pub const STATE_MAGIC: &str = "dice-game-state v1";
+/// Alte Versionskennung (Dateien ohne Historie).
+pub const STATE_MAGIC_V1: &str = "dice-game-state v1";
+/// Aktuelle Versionskennung.
+pub const STATE_MAGIC: &str = "dice-game-state v2";
 
-/// Speichert den Zustand des Spiels in `path`.
+/// Speichert den Zustand des Spiels (inkl. Historie) in `path`.
 pub fn save(game: &Game, path: impl AsRef<Path>) -> io::Result<()> {
     let mut text = String::new();
     text.push_str(STATE_MAGIC);
@@ -34,6 +41,7 @@ pub fn save(game: &Game, path: impl AsRef<Path>) -> io::Result<()> {
     text.push_str(&format!("seed={}\n", game.seed()));
     text.push_str(&format!("rounds={}\n", game.rounds_played));
     text.push_str(&format!("players={}\n", game.num_players()));
+    text.push_str(&format!("marker={}\n", game.next_history_marker()));
     text.push_str("log2=");
     for (i, p) in game.players().iter().enumerate() {
         if i > 0 {
@@ -43,10 +51,18 @@ pub fn save(game: &Game, path: impl AsRef<Path>) -> io::Result<()> {
         text.push_str(&format!("{}", p.log2_score));
     }
     text.push('\n');
+    for snap in game.history() {
+        text.push_str(&format!("hist={}", snap.round));
+        for v in &snap.log2_scores {
+            text.push(' ');
+            text.push_str(&format!("{}", v));
+        }
+        text.push('\n');
+    }
     fs::write(path, text)
 }
 
-/// Lädt ein Spiel aus einer Zustandsdatei.
+/// Lädt ein Spiel aus einer Zustandsdatei (v1 oder v2).
 ///
 /// Liefert `io::Error` mit `ErrorKind::InvalidData`, wenn die Datei nicht
 /// dem erwarteten Format entspricht.
@@ -54,28 +70,36 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<Game> {
     let text = fs::read_to_string(path)?;
     let mut seed: Option<u64> = None;
     let mut rounds: Option<u64> = None;
+    let mut marker: Option<u64> = None;
     let mut log2: Option<Vec<f64>> = None;
+    let mut history: Vec<RoundSnapshot> = Vec::new();
 
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim_end();
         if lineno == 0 {
-            if line != STATE_MAGIC {
-                return Err(invalid("erste Zeile muss 'dice-game-state v1' sein"));
+            if line != STATE_MAGIC && line != STATE_MAGIC_V1 {
+                return Err(invalid("erste Zeile muss 'dice-game-state v1' oder 'v2' sein"));
             }
             continue;
         }
         if let Some(rest) = line.strip_prefix("seed=") {
-            seed = rest
-                .trim()
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| invalid("seed ist keine Zahl"))?;
+            seed = Some(
+                rest.trim()
+                    .parse::<u64>()
+                    .map_err(|_| invalid("seed ist keine Zahl"))?,
+            );
         } else if let Some(rest) = line.strip_prefix("rounds=") {
-            rounds = rest
-                .trim()
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| invalid("rounds ist keine Zahl"))?;
+            rounds = Some(
+                rest.trim()
+                    .parse::<u64>()
+                    .map_err(|_| invalid("rounds ist keine Zahl"))?,
+            );
+        } else if let Some(rest) = line.strip_prefix("marker=") {
+            marker = Some(
+                rest.trim()
+                    .parse::<u64>()
+                    .map_err(|_| invalid("marker ist keine Zahl"))?,
+            );
         } else if let Some(rest) = line.strip_prefix("players=") {
             // redundant zu log2, wird nur geprüft
             let _: usize = rest
@@ -85,9 +109,31 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<Game> {
         } else if let Some(rest) = line.strip_prefix("log2=") {
             let values: Result<Vec<f64>, _> = rest
                 .split_whitespace()
-                .map(|tok| tok.parse::<f64>().map_err(|_| invalid("log2-Wert ist keine Zahl")))
+                .map(|tok| {
+                    tok.parse::<f64>()
+                        .map_err(|_| invalid("log2-Wert ist keine Zahl"))
+                })
                 .collect();
             log2 = Some(values?);
+        } else if let Some(rest) = line.strip_prefix("hist=") {
+            // hist=<round> <log2_0> <log2_1> ...
+            let mut tokens = rest.split_whitespace();
+            let round: u64 = tokens
+                .next()
+                .ok_or_else(|| invalid("hist ohne Rundennummer"))?
+                .parse()
+                .map_err(|_| invalid("hist-Rundennummer ist keine Zahl"))?;
+            let mut scores = Vec::new();
+            for tok in tokens {
+                scores.push(
+                    tok.parse::<f64>()
+                        .map_err(|_| invalid("hist-Wert ist keine Zahl"))?,
+                );
+            }
+            history.push(RoundSnapshot {
+                round,
+                log2_scores: scores,
+            });
         }
     }
 
@@ -97,7 +143,14 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<Game> {
     if log2.is_empty() {
         return Err(invalid("log2= enthält keine Werte"));
     }
-    Ok(Game::from_state(seed, rounds, log2))
+    // marker fehlt in v1-Dateien: aus der Historie rekonstruieren.
+    let marker = marker.unwrap_or_else(|| {
+        match history.iter().rev().find(|s| s.round > HISTORY_FULL_ROUNDS) {
+            Some(s) => s.round.saturating_mul(2).max(s.round + 1),
+            None => HISTORY_MARKER_START,
+        }
+    });
+    Ok(Game::from_state(seed, rounds, log2, history, marker))
 }
 
 /// Hilfsfunktion für Formatfehler.
@@ -127,16 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn save_load_roundtrip() {
+    fn save_load_roundtrip_mit_history() {
         let path = temp_path("roundtrip");
         let mut g = Game::new(25, 42);
-        g.play_rounds(13);
+        g.play_rounds(250); // Historie: 1..=100, 200, Endpunkt 250
         save(&g, &path).unwrap();
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.seed(), 42);
-        assert_eq!(loaded.rounds_played, 13);
+        assert_eq!(loaded.rounds_played, 250);
         assert_eq!(loaded.num_players(), 25);
+        assert_eq!(loaded.history(), g.history());
+        assert_eq!(loaded.next_history_marker(), g.next_history_marker());
         for (a, b) in g.players().iter().zip(loaded.players().iter()) {
             assert_eq!(a.log2_score, b.log2_score);
         }
@@ -144,19 +199,36 @@ mod tests {
     }
 
     #[test]
+    fn v1_datei_ohne_history_wird_akzeptiert() {
+        let path = temp_path("v1");
+        fs::write(
+            &path,
+            "dice-game-state v1\nseed=7\nrounds=3\nplayers=2\nlog2=0.1 0.2\n",
+        )
+        .unwrap();
+        let g = load(&path).unwrap();
+        assert_eq!(g.seed(), 7);
+        assert_eq!(g.rounds_played, 3);
+        assert!(g.history().is_empty());
+        assert_eq!(g.next_history_marker(), HISTORY_MARKER_START);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn geladenes_spiel_spielt_weiter_und_bleibt_reproduzierbar() {
         let path = temp_path("continue");
         let mut g = Game::new(10, 7);
-        g.play_rounds(3);
+        g.play_rounds(250);
         save(&g, &path).unwrap();
 
-        // Zweimal unabhängig laden und je 2 Runden spielen => gleiche Ergebnisse.
+        // Zweimal unabhängig laden und je 150 Runden spielen => gleiche Ergebnisse.
         let mut a = load(&path).unwrap();
         let mut b = load(&path).unwrap();
-        a.play_rounds(2);
-        b.play_rounds(2);
+        a.play_rounds(150);
+        b.play_rounds(150);
         assert_eq!(a.log2_scores(), b.log2_scores());
-        assert_eq!(a.rounds_played, 5);
+        assert_eq!(a.history(), b.history());
+        assert_eq!(a.rounds_played, 400);
         let _ = fs::remove_file(&path);
     }
 

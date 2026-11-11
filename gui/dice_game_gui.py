@@ -3,21 +3,17 @@
 dice_game_gui.py – Grafische Oberfläche (GUI) für das Würfel-Experiment „dice-game“.
 
 Die GUI ist nur die Steuerung: Die eigentliche Spielroutine läuft im
-kompilierten Rust-Binary (../dice-game/target/release/dice-game), das über
-eine Zustandsdatei persistiert und zwischen den Klicks fortgeführt wird.
+kompilierten Rust-Binary (exponential-gap/dice-game/target/release/dice-game),
+das über eine Zustandsdatei persistiert und zwischen den Klicks fortgeführt wird.
+
+Ausgabe: Liniendiagramm – x = Rundennummer, y = Spielstand, eine fortlaufende
+Linie pro Spieler. Die y-Achse ist per Button zwischen linear und
+logarithmisch (log2) umschaltbar.
 
 Aufruf:
     python3 dice_game_gui.py
 
 Nur Python-Standardbibliothek (tkinter) – keine externen Pakete nötig.
-
-Bedienung:
-    * Spieleranzahl + Seed einstellen, dann „Neu starten“.
-    * „1 Runde spielen“ spielt genau eine Runde.
-    * „N Runden spielen“ spielt die im Dropdown gewählte Anzahl
-      (1, 10, 100, 1k, 1M) auf einen Klick.
-    * Das Histogramm zeigt die Verteilung der Spielstände (log2-Raum),
-      rechts daneben Statistik und Top 10, unten ein Log.
 """
 
 from __future__ import annotations
@@ -46,11 +42,12 @@ DEFAULT_SEED = 42
 #: Zustandsdatei, über die das GUI das Rust-Binary fortführt.
 STATE_FILE = os.path.join(tempfile.gettempdir(), "dice_game_state.txt")
 
-#: Anzahl der Balken im Histogramm.
-HISTOGRAM_BINS = 40
-
 #: Ab welchem log2-Wert die Anzeige auf „2^x“ umschaltet (f64-Grenze ~2^1024).
 SCORE_DISPLAY_LIMIT = 1000.0
+
+#: Linienfarbe der Spieler bzw. des aktuellen Spitzenreiters im Diagramm.
+LINE_COLOR = "#4C78A8"
+LEADER_COLOR = "#d62728"
 
 
 def default_binary() -> str:
@@ -79,13 +76,25 @@ class EngineError(RuntimeError):
 
 
 class Snapshot:
-    """Aktueller Spielstand, aus der maschinenlesbaren Binary-Ausgabe geparst."""
+    """Aktueller Spielstand + Historie, aus der Binary-Ausgabe geparst.
 
-    def __init__(self, rounds: int, players: int, seed: int, log2_scores: list[float]):
+    `history` ist eine Liste von `(round, [log2_score_pro_spieler])`,
+    aufsteigend nach Rundennummer — die Daten für das Liniendiagramm.
+    """
+
+    def __init__(
+        self,
+        rounds: int,
+        players: int,
+        seed: int,
+        log2_scores: list[float],
+        history: list[tuple[int, list[float]]] | None = None,
+    ):
         self.rounds = rounds
         self.players = players
         self.seed = seed
-        self.log2_scores = log2_scores  # in Spielerreihenfolge
+        self.log2_scores = log2_scores  # aktueller Stand, in Spielerreihenfolge
+        self.history = history if history is not None else []
 
     # -- abgeleitete Statistik (im log2-Raum, numerisch stabil) --------------
 
@@ -123,6 +132,7 @@ def parse_output(text: str) -> Snapshot:
     """Parst die maschinenlesbare Ausgabe des Rust-Binary in einen Snapshot."""
     rounds = players = seed = None
     scores: list[tuple[int, float]] = []
+    history: list[tuple[int, list[float]]] = []
     for line in text.splitlines():
         parts = line.strip().split(",")
         if len(parts) == 3 and parts[0] == "meta":
@@ -135,12 +145,15 @@ def parse_output(text: str) -> Snapshot:
                 seed = int(val)
         elif len(parts) >= 4 and parts[0] == "player":
             scores.append((int(parts[1]), float(parts[2])))
+        elif len(parts) >= 2 and parts[0] == "hist":
+            # hist,<round>,<log2_0>,<log2_1>,...
+            history.append((int(parts[1]), [float(x) for x in parts[2:]]))
     if rounds is None or players is None or seed is None:
         raise EngineError(f"Ausgabe enthält keine vollständigen meta-Zeilen:\n{text[:300]}")
     scores.sort(key=lambda t: t[0])
     if len(scores) != players:
         raise EngineError(f"erwartet {players} Spieler, Ausgabe enthält {len(scores)}")
-    return Snapshot(rounds, players, seed, [s for _, s in scores])
+    return Snapshot(rounds, players, seed, [s for _, s in scores], history)
 
 
 class DiceGameEngine:
@@ -191,7 +204,7 @@ class DiceGameEngine:
         return self.status()
 
     def status(self) -> Snapshot:
-        """Aktuellen Stand lesen (ohne zu spielen)."""
+        """Aktuellen Stand inkl. Historie lesen (ohne zu spielen)."""
         return parse_output(self._run("status", "--state", self.state_file))
 
 
@@ -214,23 +227,36 @@ def fmt_num(x: float) -> str:
     return f"{x:.4f}"
 
 
+def fmt_big(x: float) -> str:
+    """Große lineare Spielstände (Achsenbeschriftung) kompakt formatieren."""
+    if not math.isfinite(x):
+        return "inf"
+    if x >= 1e6 or x < 1e-3:
+        return f"{x:.3e}"
+    return f"{x:.4g}"
+
+
 # ---------------------------------------------------------------------------
-# Histogramm-Leinwand
+# Liniendiagramm-Leinwand
 # ---------------------------------------------------------------------------
 
 
-class HistogramCanvas(tk.Canvas):
-    """Zeichnet die Verteilung der log2-Spielstände als Balkendiagramm."""
+class LineChartCanvas(tk.Canvas):
+    """Liniendiagramm: x = Rundennummer, y = Spielstand (linear oder log2).
+
+    Pro Spieler eine fortlaufende Linie nach rechts. Der aktuelle
+    Spitzenreiter wird hervorgehoben.
+    """
 
     def __init__(self, master, **kw):
         super().__init__(master, bg="white", highlightthickness=1, highlightbackground="#999", **kw)
-        self._data: list[float] = []
-        self._log_y = False
+        self._history: list[tuple[int, list[float]]] = []
+        self._log_y = True
         # Neu zeichnen, sobald die Größe feststeht.
         self.bind("<Configure>", lambda _e: self.redraw())
 
-    def set_data(self, log2_scores: list[float], log_y: bool) -> None:
-        self._data = sorted(log2_scores)
+    def set_data(self, history: list[tuple[int, list[float]]], log_y: bool) -> None:
+        self._history = history
         self._log_y = log_y
         self.redraw()
 
@@ -238,17 +264,18 @@ class HistogramCanvas(tk.Canvas):
         self.delete("all")
         w = max(self.winfo_width(), 300)
         h = max(self.winfo_height(), 200)
-        pad_l, pad_r, pad_t, pad_b = 70, 15, 30, 45
+        pad_l, pad_r, pad_t, pad_b = 80, 15, 34, 45
         cw, ch = w - pad_l - pad_r, h - pad_t - pad_b  # Zeichenfläche
 
         # Achsen
-        x0, y0 = pad_l, pad_t + ch  # Ursprung (links unten)
-        self.create_line(pad_l, pad_t, pad_l, y0, fill="black")
-        self.create_line(pad_l, y0, pad_l + cw, y0, fill="black")
-        self.create_text(pad_l + cw / 2, h - 12, text="log2(Spielstand)", anchor="n")
-        self.create_text(14, pad_t + ch / 2, text="Anzahl Spieler", angle=90, anchor="center")
+        y_base = pad_t + ch  # unten
+        self.create_line(pad_l, pad_t, pad_l, y_base, fill="black")
+        self.create_line(pad_l, y_base, pad_l + cw, y_base, fill="black")
+        self.create_text(pad_l + cw / 2, h - 12, text="Rundennummer", anchor="n")
+        y_label = "log2(Spielstand)" if self._log_y else "Spielstand (linear)"
+        self.create_text(16, pad_t + ch / 2, text=y_label, angle=90, anchor="center")
 
-        if not self._data:
+        if not self._history:
             self.create_text(
                 pad_l + cw / 2, pad_t + ch / 2,
                 text="Noch keine Daten – bitte „Neu starten“ klicken.",
@@ -256,62 +283,79 @@ class HistogramCanvas(tk.Canvas):
             )
             return
 
-        lo, hi = self._data[0], self._data[-1]
-        if hi <= lo:
-            hi = lo + 1.0  # entarteter Fall (z. B. nach 0 Runden)
+        rounds = [r for r, _ in self._history]
+        n_players = len(self._history[0][1])
+        rx0, rx1 = rounds[0], rounds[-1]
+        if rx1 <= rx0:
+            rx1 = rx0 + 1
 
-        # Bins über [lo, hi]
-        bins = min(HISTOGRAM_BINS, max(5, len(self._data) // 2))
-        counts = [0] * bins
-        for v in self._data:
-            idx = int((v - lo) / (hi - lo) * bins)
-            counts[min(idx, bins - 1)] += 1
+        # y-Werte: linear = 2^log2 (kann bei vielen Runden inf werden), log = log2.
+        def yval(log2: float) -> float:
+            return log2 if self._log_y else 2.0 ** log2
 
-        max_count = max(counts)
-        # y-Achse wahlweise logarithmisch (damit kleine Balken sichtbar bleiben).
-        def y_scale(c: int) -> float:
-            if self._log_y:
-                return math.log10(c + 1) / math.log10(max_count + 1)
-            return c / max_count if max_count else 0.0
+        all_vals = [yval(v) for _, scores in self._history for v in scores]
+        finite = [v for v in all_vals if math.isfinite(v)]
+        overflow = len(finite) < len(all_vals)
+        if not finite:
+            self.create_text(pad_l + cw / 2, pad_t + ch / 2, text="keine endlichen Werte", fill="#a00")
+            return
+        ymin, ymax = min(finite), max(finite)
+        if ymax <= ymin:
+            ymax = ymin + 1.0
 
-        bar_w = cw / bins
-        for i, c in enumerate(counts):
-            if c == 0:
-                continue
-            bh = y_scale(c) * ch
-            x1 = pad_l + i * bar_w
-            self.create_rectangle(
-                x1, y0 - bh, x1 + bar_w - 1, y0,
-                fill="#4C78A8", outline="#2f4f73",
-            )
+        def X(r: float) -> float:
+            return pad_l + (r - rx0) / (rx1 - rx0) * cw
 
-        # x-Achsen-Beschriftung: 5 Ticks
+        def Y(v: float) -> float:
+            return y_base - (v - ymin) / (ymax - ymin) * ch
+
+        # x-Achsen-Beschriftung: 5 Ticks (Rundennummern)
         for k in range(5):
             frac = k / 4
-            xv = pad_l + frac * cw
-            val = lo + frac * (hi - lo)
-            self.create_line(xv, y0, xv, y0 + 5, fill="black")
-            self.create_text(xv, y0 + 10, text=fmt_num(val), anchor="n")
+            rv = rx0 + frac * (rx1 - rx0)
+            xv = X(rv)
+            self.create_line(xv, y_base, xv, y_base + 5, fill="black")
+            self.create_text(xv, y_base + 10, text=str(int(rv)), anchor="n")
 
-        # y-Achsen-Beschriftung: 0 und Maximum
-        self.create_text(pad_l - 6, y0, text="0", anchor="e")
-        self.create_text(pad_l - 6, pad_t, text=str(max_count), anchor="e")
-        if self._log_y:
-            self.create_text(pad_l - 6, pad_t + 12, text="(log10)", anchor="e", fill="#666")
+        # y-Achsen-Beschriftung: 5 Ticks
+        for k in range(5):
+            frac = k / 4
+            yv = ymin + frac * (ymax - ymin)
+            ypix = Y(yv)
+            self.create_line(pad_l - 5, ypix, pad_l, ypix, fill="black")
+            label = fmt_num(yv) if self._log_y else fmt_big(yv)
+            self.create_text(pad_l - 8, ypix, text=label, anchor="e")
 
-        # Titel mit Rundenzahl
+        # Linien pro Spieler (x = Runde nach rechts, y = Spielstand)
+        leader_idx = max(range(n_players), key=lambda i: self._history[-1][1][i])
+        for i in range(n_players):
+            pts: list[float] = []
+            for r, scores in self._history:
+                v = yval(scores[i])
+                if not math.isfinite(v):
+                    v = ymax  # übergelaufene Werte oben abschneiden
+                pts.append(X(r))
+                pts.append(Y(v))
+            is_leader = i == leader_idx
+            self.create_line(
+                *pts,
+                fill=LEADER_COLOR if is_leader else LINE_COLOR,
+                width=2 if is_leader else 1,
+            )
+
+        # Titel + ggf. Überlauf-Hinweis
+        mode = "log2" if self._log_y else "linear"
         self.create_text(
             pad_l + cw / 2, 12,
-            text=f"Verteilung der Spielstände nach {self._rounds_text} Runden",
+            text=f"Spielstand je Spieler über die Runden ({n_players} Spieler, y-Achse: {mode})",
             anchor="n",
         )
-
-    # Die Rundenzahl für den Titel wird von außen gesetzt.
-    _rounds_text = "?"
-
-    def set_rounds_text(self, text: str) -> None:
-        self._rounds_text = text
-        self.redraw()
+        if overflow and not self._log_y:
+            self.create_text(
+                pad_l + cw / 2, 28,
+                text="Hinweis: Werte über dem f64-Maximum sind unendlich – in linearer Ansicht abgeschnitten. Log-Achse nutzen.",
+                fill="#a00", anchor="n",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +374,7 @@ class App(tk.Tk):
 
         self.engine: DiceGameEngine | None = None
         self.snapshot: Snapshot | None = None
+        self._log_y = True  # Startmodus der y-Achse: logarithmisch (log2)
 
         self._build_menu()
         self._build_toolbar()
@@ -401,19 +446,17 @@ class App(tk.Tk):
         main = ttk.Frame(self, padding=6)
         main.pack(side="top", fill="both", expand=True)
 
-        # Linke Seite: Histogramm + Optionen darunter
+        # Linke Seite: Liniendiagramm + Optionen darunter
         left = ttk.Frame(main)
         left.pack(side="left", fill="both", expand=True)
-        self.canvas = HistogramCanvas(left)
+        self.canvas = LineChartCanvas(left)
         self.canvas.pack(side="top", fill="both", expand=True)
         opts = ttk.Frame(left)
         opts.pack(side="bottom", fill="x", pady=(4, 0))
-        self.log_y_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            opts, text="logarithmische y-Achse", variable=self.log_y_var,
-            command=self._redraw_chart,
-        ).pack(side="left")
-        ttk.Label(opts, text="(Bins im log2-Raum;Balken = Anzahl Spieler)").pack(side="left", padx=8)
+        # Button zum Umschalten der y-Achse zwischen logarithmisch und linear.
+        self.yaxis_button = ttk.Button(opts, text=self._yaxis_button_text(), command=self._toggle_yaxis)
+        self.yaxis_button.pack(side="left")
+        ttk.Label(opts, text="(x = Rundennummer, y = Spielstand; eine Linie pro Spieler)").pack(side="left", padx=8)
 
         # Rechte Seite: Statistik + Top 10 + Log
         right = ttk.Frame(main, width=360)
@@ -540,8 +583,20 @@ class App(tk.Tk):
         dt = time.perf_counter() - t0
         self.config(cursor="")
         self.snapshot = snap
-        self.log(f"{label} gespielt → jetzt Runde {snap.rounds} ({dt:.2f} s).")
+        self.log(f"{label} gespielt → jetzt Runde {snap.rounds} ({dt:.2f} s, {len(snap.history)} History-Punkte).")
         self._refresh()
+
+    # -- y-Achse umschalten ------------------------------------------------------
+
+    def _yaxis_button_text(self) -> str:
+        return f"Y-Achse: {'log2' if self._log_y else 'linear'}"
+
+    def _toggle_yaxis(self) -> None:
+        """Schaltet die y-Achse des Diagramms zwischen log2 und linear um."""
+        self._log_y = not self._log_y
+        self.yaxis_button.config(text=self._yaxis_button_text())
+        self.log(f"Y-Achse umgeschaltet: {'log2' if self._log_y else 'linear'}.")
+        self._redraw_chart()
 
     # -- Anzeige aktualisieren ------------------------------------------------
 
@@ -567,17 +622,17 @@ class App(tk.Tk):
             self.top_tree.delete(item)
         for rank, (idx, log2) in enumerate(snap.top_players[:10], start=1):
             self.top_tree.insert("", "end", values=(rank, idx, fmt_score(log2)))
-        # Histogramm
-        self.canvas.set_rounds_text(str(snap.rounds))
+        # Liniendiagramm (x = Runde, y = Spielstand je Spieler)
         self._redraw_chart()
         self.status_var.set(
             f"Runde {snap.rounds} | {snap.players} Spieler | "
-            f"Spannweite log2: {fmt_num(snap.min_log2)} … {fmt_num(snap.max_log2)}"
+            f"Spannweite log2: {fmt_num(snap.min_log2)} … {fmt_num(snap.max_log2)} | "
+            f"Y-Achse: {'log2' if self._log_y else 'linear'}"
         )
 
     def _redraw_chart(self) -> None:
         if self.snapshot is not None:
-            self.canvas.set_data(self.snapshot.log2_scores, self.log_y_var.get())
+            self.canvas.set_data(self.snapshot.history, self._log_y)
 
     # -- Log / Hilfe ------------------------------------------------------------
 
@@ -595,6 +650,8 @@ class App(tk.Tk):
             "N Spieler starten bei Spielstand 1.0. Pro Runde würfelt jeder Spieler\n"
             "reihum; die Augenzahl 1..6 wird auf einen exponentiell steigenden\n"
             "Faktor in [1, sqrt(2)] abgebildet und mit dem Spielstand multipliziert.\n\n"
+            "Diagramm: x = Rundennummer, y = Spielstand (linear oder log2, umschaltbar),\n"
+            "eine Linie pro Spieler.\n\n"
             "Motor: Rust-Binary „dice-game“ (Projekt ../dice-game).\n"
             "GUI: Python + tkinter (nur Standardbibliothek).",
         )

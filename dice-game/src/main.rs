@@ -36,6 +36,7 @@ Maschinenlesbares Ausgabeformat (play/status/init):
   meta,players,<usize>
   meta,seed,<u64>
   player,<index>,<log2_score>,<score>
+  hist,<round>,<log2_0>,<log2_1>,...   (ein Schnappschuss je History-Runde)
 ";
 
 /// Geparste Kommandozeilen-Optionen.
@@ -158,6 +159,16 @@ fn print_machine(game: &Game) {
     println!("meta,seed,{}", game.seed());
     for p in game.players() {
         println!("player,{},{},{}", p.index, p.log2_score, p.score);
+    }
+    // Historie für das Liniendiagramm: hist,<round>,<log2_0>,<log2_1>,...
+    for snap in game.history() {
+        let vals = snap
+            .log2_scores
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("hist,{},{}", snap.round, vals);
     }
 }
 

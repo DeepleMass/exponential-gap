@@ -96,17 +96,31 @@ meta,rounds,<u64>
 meta,players,<usize>
 meta,seed,<u64>
 player,<index>,<log2_score>,<score>
+hist,<round>,<log2_0>,<log2_1>,...    # ein Schnappschuss je History-Runde
 ```
 
-### Zustandsdatei
+### Historie (für das Liniendiagramm der GUI)
+
+Damit pro Spieler und pro Runde ein Linienpunkt gezeichnet werden kann, führt
+`Game` eine Historie der Rundenstände: **jede** Runde bis Runde 100, danach
+nur noch an geometrisch wachsenden Markern (200, 400, 800, ...); der Endpunkt
+einer gespielten Sequenz wird immer mitgespeichert. So bleibt der Speicher auch
+bei 1M Runden begrenzt (ca. 115 Schnappschüsse statt 1M).
+
+### Zustandsdatei (v2)
 
 ```text
-dice-game-state v1
+dice-game-state v2
 seed=42
 rounds=10
 players=100
+marker=200
 log2=0.0 0.1 0.2 ...
+hist=1 0.0 0.1 ...
+hist=2 ...
 ```
+
+v1-Dateien (ohne Historie) werden weiterhin gelesen.
 
 ### Als Bibliothek
 
@@ -131,4 +145,6 @@ println!("geometrisches Mittel: {}", stats.geometric_mean_score());
 ## GUI
 
 Die grafische Steuerung liegt in `../gui/dice_game_gui.py` (Python/tkinter)
-und ruft dieses Binary als Motor auf.
+und ruft dieses Binary als Motor auf. Ausgabe: Liniendiagramm mit x =
+Rundennummer, y = Spielstand je Spieler (y-Achse per Button linear/log2
+umschaltbar).

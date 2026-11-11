@@ -43,6 +43,11 @@ fn count_player_lines(stdout: &str) -> usize {
     stdout.lines().filter(|l| l.starts_with("player,")).count()
 }
 
+/// Zählt die `hist,...`-Zeilen (History-Schnappschüsse) in der Ausgabe.
+fn count_hist_lines(stdout: &str) -> usize {
+    stdout.lines().filter(|l| l.starts_with("hist,")).count()
+}
+
 #[test]
 fn init_play_status_ablauf() {
     let state = temp_state("flow");
@@ -54,14 +59,19 @@ fn init_play_status_ablauf() {
     assert!(out.contains("meta,players,50"));
     assert_eq!(count_player_lines(&out), 50);
 
-    // 10 Runden spielen => rounds=10, weiterhin 50 Spieler.
+    // 10 Runden spielen => rounds=10, weiterhin 50 Spieler,
+    // Historie enthält jede der 10 Runden (hist-Zeilen 1..=10).
     let out = run_ok(&["play", "--rounds", "10", "--state", s]);
     assert!(out.contains("meta,rounds,10"));
     assert_eq!(count_player_lines(&out), 50);
+    assert_eq!(count_hist_lines(&out), 10);
+    assert!(out.contains("hist,1,"));
+    assert!(out.contains("hist,10,"));
 
-    // weitere 5 Runden => rounds=15.
+    // weitere 5 Runden => rounds=15, Historie wächst auf 15 Einträge.
     let out = run_ok(&["play", "--rounds", "5", "--state", s]);
     assert!(out.contains("meta,rounds,15"));
+    assert_eq!(count_hist_lines(&out), 15);
 
     // status ohne play ändert nichts.
     let out = run_ok(&["status", "--state", s]);
@@ -87,6 +97,21 @@ fn play_ohne_runden_standard_eins() {
     run_ok(&["init", "--players", "5", "--state", s]);
     let out = run_ok(&["play", "--state", s]); // kein --rounds
     assert!(out.contains("meta,rounds,1"));
+    assert_eq!(count_hist_lines(&out), 1); // Runde 1 ist History-Runde
+    let _ = fs::remove_file(&state);
+}
+
+#[test]
+fn history_bleibt_ueber_viele_runden_in_der_ausgabe_begrenzt() {
+    let state = temp_state("hist-cap");
+    let s = state.to_str().unwrap();
+    run_ok(&["init", "--players", "20", "--seed", "5", "--state", s]);
+    let out = run_ok(&["play", "--rounds", "5000", "--state", s]);
+    assert!(out.contains("meta,rounds,5000"));
+    // 100 volle Runden + Marker 200..3200 (5 Stück) + Endpunkt 5000 = 106.
+    let n = count_hist_lines(&out);
+    assert!(n <= 120, "zu viele hist-Zeilen: {n}");
+    assert!(out.contains("hist,5000,")); // Endpunkt enthalten
     let _ = fs::remove_file(&state);
 }
 

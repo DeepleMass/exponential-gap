@@ -89,6 +89,23 @@ fn exponential_gap_wird_sichtbar() {
 }
 
 #[test]
+fn history_ist_vollstaendig_und_gekappt() {
+    // Bis Runde 100 jede Runde, dann geometrische Marker + Endpunkt.
+    let mut game = Game::new(30, 17);
+    game.play_rounds(5000);
+    let h = game.history();
+    let rounds: Vec<u64> = h.iter().map(|s| s.round).collect();
+    assert_eq!(&rounds[..10], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(rounds[100], 200); // erste Marker nach den vollen Runden
+    assert!(!rounds.contains(&150));
+    assert_eq!(*rounds.last().unwrap(), 5000); // Endpunkt
+    assert!(h.len() <= 120);
+    // Jeder Schnappschuss hat alle Spieler und aufsteigende Runden.
+    assert!(h.iter().all(|s| s.log2_scores.len() == 30));
+    assert!(h.windows(2).all(|w| w[0].round < w[1].round));
+}
+
+#[test]
 fn sehr_viele_runden_bleiben_im_log2_raum_stabil() {
     // 1M Runden wie im GUI-Dropdown: 50 Spieler x 200_000 Runden = 1e7 Würfe.
     let mut game = Game::new(50, 3);
